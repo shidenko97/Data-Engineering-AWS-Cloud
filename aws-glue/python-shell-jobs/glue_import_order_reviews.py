@@ -1,44 +1,129 @@
-import boto3,json 
-from pg import DB 
+import json
+import logging
+from typing import Dict
 
-secret_name = 'your-secret-name'
-region_name ='eu-west-1'
+import boto3
+from botocore import client
+from pg import DB
 
-session = boto3.session.Session()
+SECRET_NAME = "redshift"
+REGION_NAME = "eu-west-1"
 
-client = session.client(service_name='secretsmanager',region_name=region_name)
 
-get_secret_value_response = client.get_secret_value(SecretId=secret_name)
+def get_client(
+        *, boto3_session: boto3.session.Session, service_name: str
+) -> client.BaseClient:
+    logging.info(f"Creating boto3 client [service_name={service_name}]")
 
-creds = json.loads(get_secret_value_response['SecretString'])
+    boto3_client = boto3_session.client(
+        service_name=service_name, region_name=REGION_NAME
+    )
 
-username = creds['username']
-password = creds['password']
-host = creds['host']
+    logging.info(f"boto3 client created [service_name={service_name}]")
 
-db = DB(dbname='dev',host=host,port=5439,user=username,passwd=password)
+    return boto3_client
 
-merge_qry = """
-			begin ; 
 
-			copy mysql_dwh_staging.order_reviews from 's3://bucket_name/order_reviews/current/order_reviews.csv'
-			iam_role 'YOUR_ARN'
-			CSV QUOTE '\"' DELIMITER ','
-			acceptinvchars;
+def get_secret_values(
+        *, boto3_session: boto3.session.Session
+) -> Dict[str, str]:
+    boto3_client = get_client(
+        boto3_session=boto3_session, service_name="secretsmanager"
+    )
 
-			delete 
-				from 
-					mysql_dwh.order_reviews 
-				using mysql_dwh_staging.order_reviews 
-				where mysql_dwh.order_reviews.review_id = mysql_dwh_staging.order_reviews.review_id;
+    logging.info("Fetching secret values")
 
-			insert into mysql_dwh.order_reviews select * from mysql_dwh_staging.order_reviews;
+    secrets = boto3_client.get_secret_value(SecretId=SECRET_NAME)
 
-			truncate table mysql_dwh_staging.order_reviews;
-			
-			end ; 
+    logging.info("Secret values fetched")
 
-			"""
+    return json.loads(secrets["SecretString"])
 
-result = db.query(merge_qry)
-print(result)
+
+def run_db_query(
+        *,
+        database: str,
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        query: str
+) -> None:
+    logging.info("Initializing DB connection")
+    logging.info(
+        f"DB params dbname={database}, host={host}, "
+        f"port={port}, user={username}"
+    )
+    logging.info(f"query={query}")
+
+    db = DB(
+        dbname=database,
+        host=host,
+        port=port,
+        user=username,
+        passwd=password
+    )
+
+    logging.info("DB connection initialized")
+
+    logging.info("Executing query")
+
+    db.query(query)
+
+    logging.info("Query executed")
+
+
+def setup_logger() -> None:
+    log_handler = logging.StreamHandler()
+    log_formatter = logging.Formatter(fmt="%(asctime)s %(message)s")
+
+    log_handler.setLevel(logging.INFO)
+    log_handler.setFormatter(log_formatter)
+
+    log = logging.getLogger()
+    log.addHandler(log_handler)
+    log.setLevel(logging.INFO)
+
+
+if __name__ == "__main__":
+    setup_logger()
+
+    session = boto3.session.Session()
+
+    credentials = get_secret_values(boto3_session=session)
+
+    merge_query = """
+        BEGIN;
+
+            -- Copy hourly data from s3 to staging table
+            COPY mysql_dwh_staging.order_reviews FROM 's3://mysql-dwh-serhii/order_reviews/current/order_reviews.csv'
+                IAM_ROLE 'arn:aws:iam::589464876810:role/Redshift'
+                CSV QUOTE '\"' DELIMITER ','
+                ACCEPTINVCHARS;
+            
+            -- Delete records from main table using staging
+            DELETE
+            FROM mysql_dwh.order_reviews
+                USING
+                    mysql_dwh_staging.order_reviews
+            WHERE mysql_dwh.order_reviews.order_id = mysql_dwh_staging.order_reviews.order_id;
+            
+            -- Insert all staging data to main table
+            INSERT INTO mysql_dwh.order_reviews
+            SELECT *
+            FROM mysql_dwh_staging.order_reviews;
+            
+            -- Truncate staging table
+            TRUNCATE TABLE mysql_dwh_staging.order_reviews;
+
+        END;
+    """
+
+    run_db_query(
+        database="ecommerce",
+        host=credentials["host"],
+        port=5439,
+        username=credentials["username"],
+        password=credentials["password"],
+        query=merge_query
+    )
